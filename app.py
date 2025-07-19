@@ -11,12 +11,13 @@ import tempfile
 from PIL import Image
 from huggingface_hub import hf_hub_download
 import shutil
+import gc
 
 from inference import (
     create_ltx_video_pipeline,
     create_latent_upsampler,
     load_image_to_tensor_with_resize_and_crop,
-    seed_everething,
+    seed_everything,  # Fixed typo
     get_device,
     calculate_padding,
     load_media_file
@@ -34,13 +35,15 @@ MAX_NUM_FRAMES = 257
 
 FPS = 30.0 
 
-# --- Global variables for loaded models ---
-pipeline_instance = None
-latent_upsampler_instance = None
+# --- Global variables for model caching ---
+_cached_pipeline = None
+_cached_upsampler = None
+_cached_config = None
 models_dir = "downloaded_models_gradio_cpu_init"
 Path(models_dir).mkdir(parents=True, exist_ok=True)
 
-print("Downloading models (if not present)...")
+# Download model paths but don't load models yet (for ZeroGPU compatibility)
+print("Preparing model paths (models will be loaded on-demand)...")
 distilled_model_actual_path = hf_hub_download(
     repo_id=LTX_REPO,
     filename=PIPELINE_CONFIG_YAML["checkpoint_path"],
@@ -59,33 +62,65 @@ spatial_upscaler_actual_path = hf_hub_download(
 )
 PIPELINE_CONFIG_YAML["spatial_upscaler_model_path"] = spatial_upscaler_actual_path
 print(f"Spatial upscaler model path: {spatial_upscaler_actual_path}")
+print("Model paths ready. Models will be loaded inside @spaces.GPU decorator.")
 
-print("Creating LTX Video pipeline on CPU...")
-pipeline_instance = create_ltx_video_pipeline(
-    ckpt_path=PIPELINE_CONFIG_YAML["checkpoint_path"],
-    precision=PIPELINE_CONFIG_YAML["precision"],
-    text_encoder_model_name_or_path=PIPELINE_CONFIG_YAML["text_encoder_model_name_or_path"],
-    sampler=PIPELINE_CONFIG_YAML["sampler"],
-    device="cpu",
-    enhance_prompt=False,
-    prompt_enhancer_image_caption_model_name_or_path=PIPELINE_CONFIG_YAML["prompt_enhancer_image_caption_model_name_or_path"],
-    prompt_enhancer_llm_model_name_or_path=PIPELINE_CONFIG_YAML["prompt_enhancer_llm_model_name_or_path"],
-)
-print("LTX Video pipeline created on CPU.")
 
-if PIPELINE_CONFIG_YAML.get("spatial_upscaler_model_path"):
-    print("Creating latent upsampler on CPU...")
-    latent_upsampler_instance = create_latent_upsampler(
-        PIPELINE_CONFIG_YAML["spatial_upscaler_model_path"],
-        device="cpu"
+def get_or_create_pipeline(config, device="cuda"):
+    """
+    Get cached pipeline or create new one if config changed.
+    This runs inside @spaces.GPU decorator for ZeroGPU compatibility.
+    """
+    global _cached_pipeline, _cached_upsampler, _cached_config
+    
+    # Create a config hash to check if we need to reload
+    config_hash = str(sorted(config.items()))
+    
+    # Check if we can reuse cached pipeline
+    if (_cached_pipeline is not None and 
+        _cached_config == config_hash and 
+        hasattr(_cached_pipeline, 'device') and 
+        str(_cached_pipeline.device) == device):
+        print("Reusing cached pipeline - no reload needed!")
+        return _cached_pipeline, _cached_upsampler
+    
+    # Clean up old models if they exist
+    if _cached_pipeline is not None:
+        print("Cleaning up old pipeline...")
+        del _cached_pipeline
+        if _cached_upsampler is not None:
+            del _cached_upsampler
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    
+    print(f"Creating new LTX Video pipeline on {device}...")
+    pipeline = create_ltx_video_pipeline(
+        ckpt_path=config["checkpoint_path"],
+        precision=config["precision"],
+        text_encoder_model_name_or_path=config["text_encoder_model_name_or_path"],
+        sampler=config["sampler"],
+        device=device,
+        enhance_prompt=False,
+        prompt_enhancer_image_caption_model_name_or_path=config["prompt_enhancer_image_caption_model_name_or_path"],
+        prompt_enhancer_llm_model_name_or_path=config["prompt_enhancer_llm_model_name_or_path"],
     )
-    print("Latent upsampler created on CPU.")
-
-target_inference_device = "cuda"
-print(f"Target inference device: {target_inference_device}")
-pipeline_instance.to(target_inference_device)
-if latent_upsampler_instance: 
-    latent_upsampler_instance.to(target_inference_device)
+    print("LTX Video pipeline created.")
+    
+    upsampler = None
+    if config.get("spatial_upscaler_model_path"):
+        print(f"Creating latent upsampler on {device}...")
+        upsampler = create_latent_upsampler(
+            config["spatial_upscaler_model_path"],
+            device=device
+        )
+        print("Latent upsampler created.")
+    
+    # Cache the models and config
+    _cached_pipeline = pipeline
+    _cached_upsampler = upsampler 
+    _cached_config = config_hash
+    
+    return pipeline, upsampler
 
 
 # --- Helper function for dimension calculation ---
@@ -185,7 +220,7 @@ def generate(prompt, negative_prompt, input_image_filepath=None, input_video_fil
 
     if randomize_seed:
         seed_ui = random.randint(0, 2**32 - 1)
-    seed_everething(int(seed_ui))
+    seed_everything(int(seed_ui))  # Fixed typo
     
     target_frames_ideal = duration_ui * FPS
     target_frames_rounded = round(target_frames_ideal)
@@ -216,7 +251,7 @@ def generate(prompt, negative_prompt, input_image_filepath=None, input_video_fil
         "width": width_padded,
         "num_frames": num_frames_padded, 
         "frame_rate": int(FPS), 
-        "generator": torch.Generator(device=target_inference_device).manual_seed(int(seed_ui)),
+        "generator": torch.Generator(device=device).manual_seed(int(seed_ui)),
         "output_type": "pt", 
         "conditioning_items": None,
         "media_items": None,
@@ -249,7 +284,7 @@ def generate(prompt, negative_prompt, input_image_filepath=None, input_video_fil
                 input_image_filepath, actual_height, actual_width
             )
             media_tensor = torch.nn.functional.pad(media_tensor, padding_values)
-            call_kwargs["conditioning_items"] = [ConditioningItem(media_tensor.to(target_inference_device), 0, 1.0)]
+            call_kwargs["conditioning_items"] = [ConditioningItem(media_tensor.to(device), 0, 1.0)]
         except Exception as e:
             print(f"Error loading image {input_image_filepath}: {e}")
             raise gr.Error(f"Could not load image: {e}")
@@ -261,12 +296,15 @@ def generate(prompt, negative_prompt, input_image_filepath=None, input_video_fil
                 width=actual_width,
                 max_frames=int(ui_frames_to_use), 
                 padding=padding_values
-            ).to(target_inference_device)
+            ).to(device)
         except Exception as e:
             print(f"Error loading video {input_video_filepath}: {e}")
             raise gr.Error(f"Could not load video: {e}")
 
-    print(f"Moving models to {target_inference_device} for inference (if not already there)...")
+    # Load or get cached models (this runs inside @spaces.GPU)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Loading models on {device}...")
+    pipeline_instance, latent_upsampler_instance = get_or_create_pipeline(PIPELINE_CONFIG_YAML, device)
     
     active_latent_upsampler = None
     if improve_texture_flag and latent_upsampler_instance:
@@ -297,7 +335,7 @@ def generate(prompt, negative_prompt, input_image_filepath=None, input_video_fil
             "second_pass": second_pass_args,
         })
         
-        print(f"Calling multi-scale pipeline (eff. HxW: {actual_height}x{actual_width}, Frames: {actual_num_frames} -> Padded: {num_frames_padded}) on {target_inference_device}")
+        print(f"Calling multi-scale pipeline (eff. HxW: {actual_height}x{actual_width}, Frames: {actual_num_frames} -> Padded: {num_frames_padded}) on {device}")
         result_images_tensor = multi_scale_pipeline_obj(**multi_scale_call_kwargs).images
     else:
         single_pass_call_kwargs = call_kwargs.copy()
@@ -315,7 +353,7 @@ def generate(prompt, negative_prompt, input_image_filepath=None, input_video_fil
         single_pass_call_kwargs.pop("second_pass", None)
         single_pass_call_kwargs.pop("downscale_factor", None)
         
-        print(f"Calling base pipeline (padded HxW: {height_padded}x{width_padded}, Frames: {actual_num_frames} -> Padded: {num_frames_padded}) on {target_inference_device}")
+        print(f"Calling base pipeline (padded HxW: {height_padded}x{width_padded}, Frames: {actual_num_frames} -> Padded: {num_frames_padded}) on {device}")
         result_images_tensor = pipeline_instance(**single_pass_call_kwargs).images
 
     if result_images_tensor is None:
@@ -404,7 +442,7 @@ with gr.Blocks(css=css) as demo:
                 step=0.1, 
                 info=f"Target video duration (0.3s to 8.5s)"
             )
-            improve_texture = gr.Checkbox(label="Improve Texture (multi-scale)", value=True,visible=False, info="Uses a two-pass generation for better quality, but is slower. Recommended for final output.")
+            improve_texture = gr.Checkbox(label="Improve Texture (multi-scale)", value=True, visible=True, info="Uses a two-pass generation for better quality, but is slower. Recommended for final output.")
 
         with gr.Column():
             output_video = gr.Video(label="Generated Video", interactive=False)
@@ -416,7 +454,7 @@ with gr.Blocks(css=css) as demo:
         with gr.Row():
             seed_input = gr.Number(label="Seed", value=42, precision=0, minimum=0, maximum=2**32-1)
             randomize_seed_input = gr.Checkbox(label="Randomize Seed", value=True)
-        with gr.Row(visible=False):
+        with gr.Row(visible=True):
             guidance_scale_input = gr.Slider(label="Guidance Scale (CFG)", minimum=1.0, maximum=10.0, value=PIPELINE_CONFIG_YAML.get("first_pass", {}).get("guidance_scale", 1.0), step=0.1, info="Controls how much the prompt influences the output. Higher values = stronger influence.")
         with gr.Row():
             height_input = gr.Slider(label="Height", value=512, step=32, minimum=MIN_DIM_SLIDER, maximum=MAX_IMAGE_SIZE, info="Must be divisible by 32.")

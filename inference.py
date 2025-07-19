@@ -176,7 +176,7 @@ def get_unique_filename(
     )
 
 
-def seed_everething(seed: int):
+def seed_everything(seed: int):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -479,7 +479,7 @@ def infer(
                 f"All conditioning start frames must be between 0 and {num_frames-1}"
             )
 
-    seed_everething(seed)
+    seed_everything(seed)
     if offload_to_cpu and not torch.cuda.is_available():
         logger.warning(
             "offload_to_cpu is set to True, but offloading will not occur since the model is already running on CPU."
