@@ -11,7 +11,7 @@ license: apache-2.0
 hardware: zero-gpu
 suggested_hardware: a100-large
 python_version: "3.11"
-short_description: Fast high-quality video generation with improved prompt understanding and ZeroGPU optimization
+short_description: Fast video generation with ZeroGPU optimization
 ---
 
 # LTX Video 0.9.8 13B Distilled
